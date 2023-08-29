@@ -19,7 +19,7 @@ use crate::config::{
 };
 use crate::constants::*;
 use crate::messages::*;
-use crate::plugins::PluginOutput;
+use crate::plugins::{PluginState, PluginOutput};
 use crate::pool::{get_pool, ClientServerMap, ConnectionPool};
 use crate::query_router::{Command, QueryRouter};
 use crate::server::Server;
@@ -769,6 +769,7 @@ where
 
         // Result returned by one of the plugins.
         let mut plugin_output = None;
+        let mut plugin_state = PluginState::new();
 
         // Prepared statement being executed
         let mut prepared_statement = None;
@@ -842,7 +843,8 @@ where
                 'Q' => {
                     if query_router.query_parser_enabled() {
                         if let Ok(ast) = QueryRouter::parse(&message) {
-                            let plugin_result = query_router.execute_plugins(&ast).await;
+                            println!("MEW1: {:?}", ast[0]);
+                            let plugin_result = query_router.execute_plugins_pre(&mut plugin_state, &ast).await;
 
                             match plugin_result {
                                 Ok(PluginOutput::Deny(error)) => {
@@ -873,7 +875,8 @@ where
 
                     if query_router.query_parser_enabled() {
                         if let Ok(ast) = QueryRouter::parse(&message) {
-                            if let Ok(output) = query_router.execute_plugins(&ast).await {
+                            println!("MEW2: {:?}", ast[0]);
+                            if let Ok(output) = query_router.execute_plugins_pre(&mut plugin_state, &ast).await {
                                 plugin_output = Some(output);
                             }
 
@@ -1222,7 +1225,8 @@ where
                     'Q' => {
                         if query_router.query_parser_enabled() {
                             if let Ok(ast) = QueryRouter::parse(&message) {
-                                let plugin_result = query_router.execute_plugins(&ast).await;
+                                println!("MEW3: {:?}", ast[0]);
+                                let plugin_result = query_router.execute_plugins_pre(&mut plugin_state, &ast).await;
 
                                 match plugin_result {
                                     Ok(PluginOutput::Deny(error)) => {
@@ -1291,7 +1295,8 @@ where
 
                         if query_router.query_parser_enabled() {
                             if let Ok(ast) = QueryRouter::parse(&message) {
-                                if let Ok(output) = query_router.execute_plugins(&ast).await {
+                                println!("MEW4: {:?}", ast[0]);
+                                if let Ok(output) = query_router.execute_plugins_pre(&mut plugin_state, &ast).await {
                                     plugin_output = Some(output);
                                 }
                             }

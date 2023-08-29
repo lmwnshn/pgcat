@@ -759,6 +759,7 @@ impl Default for Shard {
 pub struct Plugins {
     pub intercept: Option<Intercept>,
     pub table_access: Option<TableAccess>,
+    pub query_cache: Option<QueryCache>,
     pub query_logger: Option<QueryLogger>,
     pub prewarmer: Option<Prewarmer>,
 }
@@ -767,9 +768,10 @@ impl std::fmt::Display for Plugins {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         write!(
             f,
-            "interceptor: {}, table_access: {}, query_logger: {}, prewarmer: {}",
+            "interceptor: {}, table_access: {}, query_cache: {}, query_logger: {}, prewarmer: {}",
             self.intercept.is_some(),
             self.table_access.is_some(),
+            self.query_cache.is_some(),
             self.query_logger.is_some(),
             self.prewarmer.is_some(),
         )
@@ -786,6 +788,11 @@ pub struct Intercept {
 pub struct TableAccess {
     pub enabled: bool,
     pub tables: Vec<String>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Default, Hash, Eq)]
+pub struct QueryCache {
+    pub enabled: bool,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Default, Hash, Eq)]

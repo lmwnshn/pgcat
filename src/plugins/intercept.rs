@@ -13,7 +13,7 @@ use crate::{
     config::Intercept as InterceptConfig,
     errors::Error,
     messages::{command_complete, data_row_nullable, row_description, DataType},
-    plugins::{Plugin, PluginOutput},
+    plugins::{Plugin, PluginState, PluginOutput},
     query_router::QueryRouter,
 };
 
@@ -42,6 +42,7 @@ impl<'a> Plugin for Intercept<'a> {
     async fn run(
         &mut self,
         query_router: &QueryRouter,
+        _plugin_state: &mut PluginState,
         ast: &Vec<Statement>,
     ) -> Result<PluginOutput, Error> {
         if !self.enabled || ast.is_empty() {
@@ -117,4 +118,12 @@ impl<'a> Plugin for Intercept<'a> {
             Ok(PluginOutput::Allow)
         }
     }
+
+    async fn run_post(
+        &mut self,
+        query_router: &QueryRouter,
+        plugin_state: &mut PluginState,
+        ast: &Vec<Statement>,
+        responses: &Vec<Vec<BytesMut>>,
+    ) {}
 }

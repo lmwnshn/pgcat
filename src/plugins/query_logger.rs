@@ -2,10 +2,11 @@
 
 use crate::{
     errors::Error,
-    plugins::{Plugin, PluginOutput},
+    plugins::{Plugin, PluginState, PluginOutput},
     query_router::QueryRouter,
 };
 use async_trait::async_trait;
+use bytes::BytesMut;
 use log::info;
 use sqlparser::ast::Statement;
 
@@ -20,6 +21,7 @@ impl<'a> Plugin for QueryLogger<'a> {
     async fn run(
         &mut self,
         _query_router: &QueryRouter,
+        _plugin_state: &mut PluginState,
         ast: &Vec<Statement>,
     ) -> Result<PluginOutput, Error> {
         if !self.enabled {
@@ -35,4 +37,12 @@ impl<'a> Plugin for QueryLogger<'a> {
 
         Ok(PluginOutput::Allow)
     }
+
+    async fn run_post(
+        &mut self,
+        query_router: &QueryRouter,
+        plugin_state: &mut PluginState,
+        ast: &Vec<Statement>,
+        responses: &Vec<Vec<BytesMut>>,
+    ) {}
 }

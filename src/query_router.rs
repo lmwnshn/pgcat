@@ -15,7 +15,7 @@ use sqlparser::parser::Parser;
 use crate::config::Role;
 use crate::errors::Error;
 use crate::messages::BytesMutReader;
-use crate::plugins::{Intercept, Plugin, PluginOutput, QueryLogger, TableAccess};
+use crate::plugins::{Intercept, Plugin, PluginOutput, PluginState, QueryCache, QueryLogger, TableAccess};
 use crate::pool::PoolSettings;
 use crate::sharding::Sharder;
 
@@ -790,11 +790,20 @@ impl QueryRouter {
     }
 
     /// Add your plugins here and execute them.
-    pub async fn execute_plugins(&self, ast: &Vec<Statement>) -> Result<PluginOutput, Error> {
+    pub async fn execute_plugins_pre(&self, plugin_state: &mut PluginState, ast: &Vec<Statement>) -> Result<PluginOutput, Error> {
         let plugins = match self.pool_settings.plugins {
             Some(ref plugins) => plugins,
             None => return Ok(PluginOutput::Allow),
         };
+
+        if let Some(ref query_cache) = plugins.query_cache {
+            let mut query_cache = QueryCache {
+                enabled: query_cache.enabled,
+                user: &self.pool_settings.user.username,
+                db: &self.pool_settings.db,
+            };
+            let _ = query_cache.run(&self, plugin_state, ast).await;
+        }
 
         if let Some(ref query_logger) = plugins.query_logger {
             let mut query_logger = QueryLogger {
@@ -803,7 +812,7 @@ impl QueryRouter {
                 db: &self.pool_settings.db,
             };
 
-            let _ = query_logger.run(&self, ast).await;
+            let _ = query_logger.run(&self, plugin_state, ast).await;
         }
 
         if let Some(ref intercept) = plugins.intercept {
@@ -812,7 +821,7 @@ impl QueryRouter {
                 config: &intercept,
             };
 
-            let result = intercept.run(&self, ast).await;
+            let result = intercept.run(&self, plugin_state, ast).await;
 
             if let Ok(PluginOutput::Intercept(output)) = result {
                 return Ok(PluginOutput::Intercept(output));
@@ -825,7 +834,61 @@ impl QueryRouter {
                 tables: &table_access.tables,
             };
 
-            let result = table_access.run(&self, ast).await;
+            let result = table_access.run(&self, plugin_state, ast).await;
+
+            if let Ok(PluginOutput::Deny(error)) = result {
+                return Ok(PluginOutput::Deny(error));
+            }
+        }
+
+        Ok(PluginOutput::Allow)
+    }
+
+    pub async fn execute_plugins_post(&self, plugin_state: &mut PluginState, ast: &Vec<Statement>) -> Result<PluginOutput, Error> {
+        let plugins = match self.pool_settings.plugins {
+            Some(ref plugins) => plugins,
+            None => return Ok(PluginOutput::Allow),
+        };
+
+        if let Some(ref query_cache) = plugins.query_cache {
+            let mut query_cache = QueryCache {
+                enabled: query_cache.enabled,
+                user: &self.pool_settings.user.username,
+                db: &self.pool_settings.db,
+            };
+            let _ = query_cache.run_post(&self, plugin_state, ast).await;
+        }
+
+        if let Some(ref query_logger) = plugins.query_logger {
+            let mut query_logger = QueryLogger {
+                enabled: query_logger.enabled,
+                user: &self.pool_settings.user.username,
+                db: &self.pool_settings.db,
+            };
+
+            let _ = query_logger.run(&self, plugin_state, ast).await;
+        }
+
+        if let Some(ref intercept) = plugins.intercept {
+            let mut intercept = Intercept {
+                enabled: intercept.enabled,
+                config: &intercept,
+            };
+
+            let result = intercept.run(&self, plugin_state, ast).await;
+
+            if let Ok(PluginOutput::Intercept(output)) = result {
+                return Ok(PluginOutput::Intercept(output));
+            }
+        }
+
+        if let Some(ref table_access) = plugins.table_access {
+            let mut table_access = TableAccess {
+                enabled: table_access.enabled,
+                tables: &table_access.tables,
+            };
+
+            let result = table_access.run(&self, plugin_state, ast).await;
 
             if let Ok(PluginOutput::Deny(error)) = result {
                 return Ok(PluginOutput::Deny(error));
@@ -1406,6 +1469,7 @@ mod test {
         let plugins = Plugins {
             table_access: Some(table_access),
             intercept: None,
+            query_cache: None,
             query_logger: None,
             prewarmer: None,
         };
@@ -1420,8 +1484,9 @@ mod test {
 
         let query = simple_query("SELECT * FROM pg_database");
         let ast = QueryRouter::parse(&query).unwrap();
+        let mut plugin_state = PluginState::new();
 
-        let res = qr.execute_plugins(&ast).await;
+        let res = qr.execute_plugins_pre(&mut plugin_state, &ast).await;
 
         assert_eq!(
             res,
@@ -1439,7 +1504,7 @@ mod test {
         let query = simple_query("SELECT * FROM pg_database");
         let ast = QueryRouter::parse(&query).unwrap();
 
-        let res = qr.execute_plugins(&ast).await;
+        let res = qr.execute_plugins_pre(&ast).await;
 
         assert_eq!(res, Ok(PluginOutput::Allow));
     }

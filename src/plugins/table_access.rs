@@ -2,11 +2,12 @@
 //! table as part of their query. If they can't, the query will not be routed.
 
 use async_trait::async_trait;
+use bytes::BytesMut;
 use sqlparser::ast::{visit_relations, Statement};
 
 use crate::{
     errors::Error,
-    plugins::{Plugin, PluginOutput},
+    plugins::{Plugin, PluginState, PluginOutput},
     query_router::QueryRouter,
 };
 
@@ -24,6 +25,7 @@ impl<'a> Plugin for TableAccess<'a> {
     async fn run(
         &mut self,
         _query_router: &QueryRouter,
+        _plugin_state: &mut PluginState,
         ast: &Vec<Statement>,
     ) -> Result<PluginOutput, Error> {
         if !self.enabled {
@@ -56,4 +58,12 @@ impl<'a> Plugin for TableAccess<'a> {
             Ok(PluginOutput::Allow)
         }
     }
+
+    async fn run_post(
+        &mut self,
+        query_router: &QueryRouter,
+        plugin_state: &mut PluginState,
+        ast: &Vec<Statement>,
+        responses: &Vec<Vec<BytesMut>>,
+    ) {}
 }
