@@ -1,7 +1,7 @@
 use crate::errors::{ClientIdentifier, Error};
 use crate::pool::BanReason;
 /// Handle clients by pretending to be a PostgreSQL server.
-use bytes::{Buf, BufMut, BytesMut};
+use bytes::{Buf, BufMut, BytesMut, Bytes};
 use log::{debug, error, info, trace, warn};
 use once_cell::sync::Lazy;
 use std::collections::HashMap;
@@ -38,6 +38,35 @@ enum ClientConnectionType {
     Startup,
     Tls,
     CancelQuery,
+}
+
+#[derive(Debug)]
+struct ClientMessage {
+    code: u8,
+    pos_start: usize,
+    pos_end: usize,
+    query: Option<String>,
+    portal_name: Option<String>,
+    statement_name: Option<String>,
+    limit: Option<i32>,
+}
+
+#[derive(Clone, Debug)]
+struct ServerPacket {
+    code: u8,
+    contents_len: i32,
+    contents: Option<Bytes>,
+}
+
+#[derive(Debug)]
+struct BufferMeta {
+    messages: Vec<ClientMessage>,
+}
+
+impl BufferMeta {
+    fn new() -> Self {
+        BufferMeta { messages: vec![] }
+    }
 }
 
 /// The client state. One of these is created per client.
@@ -104,6 +133,23 @@ pub struct Client<S, T> {
 
     /// Prepared statements
     prepared_statements: HashMap<String, Parse>,
+    reverse_prepared_statements: HashMap<String, String>,
+
+    /// Key for anonymous portal.
+    portal_anon_key: String,
+
+    /// Key for anonymous prepare.
+    prepared_statements_anon_key: String,
+
+    /// Buffer metadata
+    buffer_meta: BufferMeta,
+
+    portal_name_to_statement_name: HashMap<String, String>,
+
+    // Cache
+    query_cache: HashMap<String, Vec<ServerPacket>>,
+    describe_portal_cache: HashMap<String, Vec<ServerPacket>>,
+    describe_statement_cache: HashMap<String, Vec<ServerPacket>>,
 }
 
 /// Client entrypoint.
@@ -694,6 +740,14 @@ where
             shutdown,
             connected_to_server: false,
             prepared_statements: HashMap::new(),
+            reverse_prepared_statements: HashMap::new(),
+            portal_anon_key: "HAKUNA".to_string(),
+            prepared_statements_anon_key: "MATATA".to_string(),
+            buffer_meta: BufferMeta::new(),
+            portal_name_to_statement_name: HashMap::new(),
+            query_cache: HashMap::new(),
+            describe_portal_cache: HashMap::new(),
+            describe_statement_cache: HashMap::new(),
         })
     }
 
@@ -729,6 +783,14 @@ where
             shutdown,
             connected_to_server: false,
             prepared_statements: HashMap::new(),
+            reverse_prepared_statements: HashMap::new(),
+            portal_anon_key: "HAKUNA".to_string(),
+            prepared_statements_anon_key: "MATATA".to_string(),
+            portal_name_to_statement_name: HashMap::new(),
+            buffer_meta: BufferMeta::new(),
+            query_cache: HashMap::new(),
+            describe_portal_cache: HashMap::new(),
+            describe_statement_cache: HashMap::new(),
         })
     }
 
@@ -812,6 +874,102 @@ where
                 message_result = read_message(&mut self.read) => message_result?
             };
 
+            let put_wrapper = |s: &mut Self, buf: &BytesMut| {
+                let code = buf[0];
+
+                let mut query = None;
+                let mut portal_name = None;
+                let mut statement_name = None;
+                let mut limit = None;
+                match code {
+                    b'Q' => {
+                        let query_tmp = buf[5..(buf.len() - 1)].to_vec();
+                        query = Some(unsafe { String::from_utf8_unchecked(query_tmp) });
+                    }
+                    b'P' => {
+                        let pos1 = buf[5..].iter().position(|&x| x == b'\0').unwrap() + 5;
+                        let pos2 = buf[pos1..].iter().position(|&x| x == b'\0').unwrap() + pos1;
+
+                        let statement_name_tmp = buf[5..pos1].to_vec();
+                        statement_name = Some(if statement_name_tmp.len() == 0 {
+                            s.prepared_statements_anon_key.clone()
+                        } else {
+                            let original_name = unsafe { String::from_utf8_unchecked(statement_name_tmp) };
+                            s.reverse_prepared_statements.get(&original_name).unwrap().clone()
+                        });
+                        let query_tmp = buf[pos1..pos2].to_vec();
+                        query = Some(unsafe { String::from_utf8_unchecked(query_tmp) });
+                    }
+                    b'B' => {
+                        let pos1 = buf[5..].iter().position(|&x| x == b'\0').unwrap() + 5;
+                        let pos2 = buf[pos1..].iter().position(|&x| x == b'\0').unwrap() + pos1;
+
+                        let portal_name_tmp = buf[5..pos1].to_vec();
+                        portal_name = Some(if portal_name_tmp.len() == 0 {
+                            s.prepared_statements_anon_key.clone()
+                        } else {
+                            unsafe { String::from_utf8_unchecked(portal_name_tmp) }
+                        });
+                        let statement_name_tmp = buf[pos1..pos2].to_vec();
+                        statement_name = Some(if statement_name_tmp.len() == 0 {
+                            s.prepared_statements_anon_key.clone()
+                        } else {
+                            let original_name = unsafe { String::from_utf8_unchecked(statement_name_tmp) };
+                            s.reverse_prepared_statements.get(&original_name).unwrap().clone()
+                        });
+                    }
+                    b'D' => {
+                        let target_tmp = buf[6..(buf.len() - 1)].to_vec();
+                        match buf[5] {
+                            b'S' => {
+                                statement_name = Some(if target_tmp.len() == 0 {
+                                    s.prepared_statements_anon_key.clone()
+                                } else {
+                                    unsafe { String::from_utf8_unchecked(target_tmp) }
+                                });
+                            }
+                            b'P' => {
+                                portal_name = Some(if target_tmp.len() == 0 {
+                                    s.portal_anon_key.clone()
+                                } else {
+                                    unsafe { String::from_utf8_unchecked(target_tmp) }
+                                });
+                            }
+                            _ => (),
+                        }
+                    }
+                    b'E' => {
+                        limit = Some(i32::from_be_bytes(buf[(buf.len() - 4)..(buf.len())].try_into().unwrap()));
+                        let portal_name_tmp = buf[5..(buf.len() - 4 - 1)].to_vec();
+                        portal_name = Some(if portal_name_tmp.len() == 0 {
+                            s.prepared_statements_anon_key.clone()
+                        } else {
+                            unsafe { String::from_utf8_unchecked(portal_name_tmp) }
+                        });
+                    }
+                    _ => (),
+                }
+
+                let pos_start = s.buffer.len();
+                s.buffer.put(&buf[..]);
+                let pos_end = s.buffer.len();
+
+                s.buffer_meta.messages.push(ClientMessage {
+                    code,
+                    pos_start,
+                    pos_end,
+                    query,
+                    portal_name,
+                    statement_name,
+                    limit,
+                });
+            };
+
+            let clear_wrapper = |s: &mut Self| {
+                s.buffer.clear();
+                s.buffer_meta.messages.clear();
+            };
+
             match message[0] as char {
                 // Buffer extended protocol messages even if we do not have
                 // a server connection yet. Hopefully, when we get the S message
@@ -830,12 +988,12 @@ where
                         }
                     }
 
-                    self.buffer.put(&message[..]);
+                    put_wrapper(self, &message);
                     continue;
                 }
 
                 'E' => {
-                    self.buffer.put(&message[..]);
+                    put_wrapper(self, &message);
                     continue;
                 }
 
@@ -869,7 +1027,7 @@ where
                         will_prepare = true;
                     }
 
-                    self.buffer.put(&message[..]);
+                    put_wrapper(self, &message);
 
                     if query_router.query_parser_enabled() {
                         if let Ok(ast) = QueryRouter::parse(&message) {
@@ -889,7 +1047,7 @@ where
                         (prepared_statement, message) = self.rewrite_bind(message).await?;
                     }
 
-                    self.buffer.put(&message[..]);
+                    put_wrapper(self, &message);
 
                     if query_router.query_parser_enabled() {
                         query_router.infer_shard_from_bind(&message);
@@ -932,7 +1090,7 @@ where
             // Check on plugin results.
             match plugin_output {
                 Some(PluginOutput::Deny(error)) => {
-                    self.buffer.clear();
+                    clear_wrapper(self);
                     error_response(&mut self.write, &error).await?;
                     plugin_output = None;
                     continue;
@@ -1044,7 +1202,7 @@ where
 
                     if message[0] as char == 'S' {
                         error!("Got Sync message but failed to get a connection from the pool");
-                        self.buffer.clear();
+                        clear_wrapper(self);
                     }
 
                     error_response(&mut self.write, "could not get connection from the pool")
@@ -1220,8 +1378,20 @@ where
                 match code {
                     // Query
                     'Q' => {
+                        let mut buffer_meta : Option<BufferMeta> = None;
                         if query_router.query_parser_enabled() {
                             if let Ok(ast) = QueryRouter::parse(&message) {
+                                buffer_meta = Some(BufferMeta {
+                                    messages: vec![ClientMessage{
+                                        code: b'Q',
+                                        pos_start: 0,
+                                        pos_end: message.len(),
+                                        query: Some(unsafe {String::from_utf8_unchecked(message[5..].to_vec())}),
+                                        portal_name: None,
+                                        statement_name: None,
+                                        limit: None,
+                                    }],
+                                });
                                 let plugin_result = query_router.execute_plugins(&ast).await;
 
                                 match plugin_result {
@@ -1246,6 +1416,7 @@ where
                         self.send_and_receive_loop(
                             code,
                             Some(&message),
+                            buffer_meta.as_ref(),
                             server,
                             &address,
                             &pool,
@@ -1297,7 +1468,7 @@ where
                             }
                         }
 
-                        self.buffer.put(&message[..]);
+                        put_wrapper(self, &message);
                     }
 
                     // Bind
@@ -1307,7 +1478,7 @@ where
                             (prepared_statement, message) = self.rewrite_bind(message).await?;
                         }
 
-                        self.buffer.put(&message[..]);
+                        put_wrapper(self, &message);
                     }
 
                     // Describe
@@ -1322,7 +1493,7 @@ where
                             }
                         }
 
-                        self.buffer.put(&message[..]);
+                        put_wrapper(self, &message);
                     }
 
                     // Close the prepared statement.
@@ -1342,13 +1513,13 @@ where
                             }
                         }
 
-                        self.buffer.put(&message[..]);
+                        put_wrapper(self, &message);
                     }
 
                     // Execute
                     // Execute a prepared statement prepared in `P` and bound in `B`.
                     'E' => {
-                        self.buffer.put(&message[..]);
+                        put_wrapper(self, &message);
                     }
 
                     // Sync
@@ -1360,21 +1531,21 @@ where
                             Some(PluginOutput::Deny(error)) => {
                                 error_response(&mut self.write, &error).await?;
                                 plugin_output = None;
-                                self.buffer.clear();
+                                clear_wrapper(self);
                                 continue;
                             }
 
                             Some(PluginOutput::Intercept(result)) => {
                                 write_all(&mut self.write, result).await?;
                                 plugin_output = None;
-                                self.buffer.clear();
+                                clear_wrapper(self);
                                 continue;
                             }
 
                             _ => (),
                         };
 
-                        self.buffer.put(&message[..]);
+                        put_wrapper(self, &message);
 
                         let first_message_code = (*self.buffer.get(0).unwrap_or(&0)) as char;
 
@@ -1395,6 +1566,7 @@ where
                         self.send_and_receive_loop(
                             code,
                             None,
+                            None,
                             server,
                             &address,
                             &pool,
@@ -1402,7 +1574,7 @@ where
                         )
                         .await?;
 
-                        self.buffer.clear();
+                        clear_wrapper(self);
 
                         if !server.in_transaction() {
                             self.stats.transaction();
@@ -1418,14 +1590,14 @@ where
 
                     // CopyData
                     'd' => {
-                        self.buffer.put(&message[..]);
+                        put_wrapper(self, &message);
 
                         // Want to limit buffer size
                         if self.buffer.len() > 8196 {
                             // Forward the data to the server,
                             self.send_server_message(server, &self.buffer, &address, &pool)
                                 .await?;
-                            self.buffer.clear();
+                            clear_wrapper(self);
                         }
                     }
 
@@ -1433,13 +1605,13 @@ where
                     // Copy is done, successfully or not.
                     'c' | 'f' => {
                         // We may already have some copy data in the buffer, add this message to buffer
-                        self.buffer.put(&message[..]);
+                        put_wrapper(self, &message);
 
                         self.send_server_message(server, &self.buffer, &address, &pool)
                             .await?;
 
                         // Clear the buffer
-                        self.buffer.clear();
+                        clear_wrapper(self);
 
                         let response = self
                             .receive_server_message(server, &address, &pool, &self.stats.clone())
@@ -1523,6 +1695,7 @@ where
         // Don't rewrite anonymous prepared statements
         if parse.anonymous() {
             debug!("Anonymous prepared statement");
+            self.prepared_statements.insert("MATATA".into(), parse.clone());
             return Ok((None, message));
         }
 
@@ -1534,6 +1707,7 @@ where
         );
 
         self.prepared_statements.insert(name.clone(), parse.clone());
+        self.reverse_prepared_statements.insert(parse.name.clone(), name.clone());
 
         Ok((Some(name), parse.try_into()?))
     }
@@ -1624,6 +1798,7 @@ where
         &mut self,
         code: char,
         message: Option<&BytesMut>,
+        buffer_meta: Option<&BufferMeta>,
         server: &mut Server,
         address: &Address,
         pool: &ConnectionPool,
@@ -1636,16 +1811,156 @@ where
             None => &self.buffer,
         };
 
-        self.send_server_message(server, message, address, pool)
+
+        let mut meta_num = 0;
+        let mut meta_processed_until = 0;
+        let mut fake_responses : Vec<ServerPacket> = vec![];
+        {
+            let buffer_meta = match buffer_meta {
+                Some(buffer_meta) => buffer_meta,
+                None => &self.buffer_meta,
+            };
+            while meta_num < buffer_meta.messages.len() {
+                let meta = &buffer_meta.messages[meta_num];
+                match meta.code {
+                    b'Q' => {
+                        match self.query_cache.get(meta.query.as_ref().unwrap()) {
+                            Some(packets) => {
+                                fake_responses.extend(packets.to_vec());
+                                meta_processed_until = meta.pos_end;
+                                meta_num += 1;
+                                continue;
+                            }
+                            None => {
+                                println!("Q BREAKING");
+                                break
+                            }
+                        }
+                    }
+                    b'P' => {
+                        let query_known = self.query_cache.contains_key(meta.query.as_ref().unwrap());
+                        let statement_bound = match self.prepared_statements.get(meta.statement_name.as_ref().unwrap()) {
+                            None => { break; }
+                            Some(parse) => { &parse.query == meta.query.as_ref().unwrap() }
+                        };
+                        if query_known && statement_bound {
+                            fake_responses.push(ServerPacket {
+                                code: b'1',
+                                contents_len: 5,
+                                contents: None,
+                            });
+                            meta_processed_until = meta.pos_end;
+                            meta_num += 1;
+                            continue;
+                        } else {
+                            println!("P BREAKING");
+                            break
+                        }
+                    }
+                    b'B' => {
+                        let statement_known = self.prepared_statements.contains_key(meta.statement_name.as_ref().unwrap());
+                        if statement_known {
+                            self.portal_name_to_statement_name.insert(meta.portal_name.clone().unwrap(), meta.statement_name.clone().unwrap());
+                            fake_responses.push(ServerPacket {
+                                code: b'2',
+                                contents_len: 5,
+                                contents: None,
+                            });
+                            meta_processed_until = meta.pos_end;
+                            meta_num += 1;
+                            continue;
+                        } else {
+                            println!("B BREAKING");
+                            break
+                        }
+                    }
+                    b'D' => {
+                        let packets = if meta.portal_name.is_some() {
+                            self.describe_portal_cache.get(meta.portal_name.as_ref().unwrap()).unwrap()
+                        } else {
+                            self.describe_statement_cache.get(meta.statement_name.as_ref().unwrap()).unwrap()
+                        };
+                        fake_responses.extend(packets.to_vec());
+                        meta_processed_until = meta.pos_end;
+                        meta_num += 1;
+                        continue;
+                    }
+                    b'E' => {
+                        let statement_name = self.portal_name_to_statement_name.get(meta.portal_name.as_ref().unwrap()).unwrap();
+                        match self.prepared_statements.get(statement_name) {
+                            None => { break; }
+                            Some(parse) => {
+                                let query = &parse.query;
+                                if let Some(packets) = self.query_cache.get(query) {
+                                    fake_responses.extend(packets.to_vec());
+                                    meta_processed_until = meta.pos_end;
+                                    meta_num += 1;
+                                    continue;
+                                } else {
+                                    println!("E BREAKING");
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    b'S' => {
+                        let mut b = BytesMut::new();
+                        b.put_u8(b'I');
+                        fake_responses.push(ServerPacket {
+                            code: b'Z',
+                            contents_len: 5,
+                            contents: Some(b.freeze()),
+                        });
+                        meta_processed_until = meta.pos_end;
+                        meta_num += 1;
+                        continue;
+                    }
+                    _ => {
+                        println!("_ BREAKING");
+                        break;
+                    }
+                }
+            }
+        }
+
+        // println!("{:?}", buffer_meta);
+        // println!("{:?}", fake_responses);
+        // println!("{} {}", meta_processed_until, message.len());
+
+        let mut b = BytesMut::with_capacity(4196);
+        for packet in fake_responses {
+            b.clear();
+            b.put_u8(packet.code);
+            b.put_i32(packet.contents_len);
+            b.extend(packet.contents);
+            match write_all_flush(&mut self.write, &b).await {
+                Ok(_) => (),
+                Err(err) => {
+                    return Err(err);
+                }
+            };
+        }
+
+        if meta_processed_until == message.len() {
+            return Ok(())
+        }
+
+        let remaining_message = message[meta_processed_until..].into();
+
+        self.send_server_message(server, &remaining_message, address, pool)
             .await?;
 
         let query_start = Instant::now();
         // Read all data the server has to offer, which can be multiple messages
         // buffered in 8196 bytes chunks.
+        let mut server_packets = vec![];
+
         loop {
             let response = self
                 .receive_server_message(server, address, pool, client_stats)
                 .await?;
+            let response = response.freeze();
+            let mut resp = response.clone();
 
             match write_all_flush(&mut self.write, &response).await {
                 Ok(_) => (),
@@ -1655,11 +1970,100 @@ where
                 }
             };
 
+            let buffer_meta = match buffer_meta {
+                Some(buffer_meta) => buffer_meta,
+                None => &self.buffer_meta,
+            };
+            let mut message_meta = &buffer_meta.messages[meta_num];
+            while resp.has_remaining() {
+                let code = resp.get_u8();
+                let contents_len = resp.get_i32();
+                let contents = if contents_len == 4 {
+                    None
+                } else {
+                    Some(resp.split_to((contents_len - 4) as usize))
+                };
+
+                server_packets.push(ServerPacket{
+                    code,
+                    contents_len,
+                    contents
+                });
+
+                if message_meta.code == b'Q' && code == b'Z' {
+                    // println!("QUERY {:?}, got {:?}", &message_meta, &server_packets);
+                    self.query_cache.insert(message_meta.query.clone().unwrap(), server_packets);
+                    server_packets = vec![];
+                    meta_num += 1;
+                    if resp.has_remaining() && meta_num < buffer_meta.messages.len() {
+                        message_meta = &buffer_meta.messages[meta_num];
+                    }
+                    continue;
+                }
+                if message_meta.code == b'P' && code == b'1' {
+                    let statement_name = message_meta.statement_name.clone().unwrap();
+                    // println!("PARSE: Statement {} -> Query {:?}", message_meta.statement_name.clone().unwrap(), self.prepared_statements.get(&statement_name).unwrap().query);
+                    server_packets = vec![];
+                    meta_num += 1;
+                    if resp.has_remaining() && meta_num < buffer_meta.messages.len() {
+                        message_meta = &buffer_meta.messages[meta_num];
+                    }
+                    continue;
+                }
+                if message_meta.code == b'B' && code == b'2' {
+                    // println!("BIND: Portal {} -> Statement {}", message_meta.portal_name.clone().unwrap(), message_meta.statement_name.clone().unwrap());
+                    self.portal_name_to_statement_name.insert(message_meta.portal_name.clone().unwrap(), message_meta.statement_name.clone().unwrap());
+                    server_packets = vec![];
+                    meta_num += 1;
+                    if resp.has_remaining() && meta_num < buffer_meta.messages.len() {
+                        message_meta = &buffer_meta.messages[meta_num];
+                    }
+                    continue;
+                }
+                if message_meta.code == b'D' {
+                    if message_meta.portal_name.is_some() {
+                        // println!("DESCRIBE PORTAL {:?}: {:?}", message_meta.portal_name.clone().unwrap(), &server_packets);
+                        self.describe_portal_cache.insert(message_meta.portal_name.clone().unwrap(), server_packets);
+                    } else {
+                        // println!("DESCRIBE STATEMENT {:?}: {:?}", message_meta.statement_name.clone().unwrap(), &server_packets);
+                        self.describe_statement_cache.insert(message_meta.statement_name.clone().unwrap(), server_packets);
+                    };
+                    
+                    server_packets = vec![];
+                    meta_num += 1;
+                    if resp.has_remaining() && meta_num < buffer_meta.messages.len() {
+                        message_meta = &buffer_meta.messages[meta_num];
+                    }
+                    continue;
+                }
+                if message_meta.code == b'E' && code == b'C' {
+                    let statement_name = self.portal_name_to_statement_name.get(message_meta.portal_name.as_ref().unwrap()).unwrap();
+                    let parse = self.prepared_statements.get(statement_name).unwrap();
+                    // println!("EXEC {}, got {} packets", parse.query.clone(), server_packets.len());
+                    self.query_cache.insert(parse.query.clone(), server_packets);
+                    server_packets = vec![];
+                    meta_num += 1;
+                    if resp.has_remaining() && meta_num < buffer_meta.messages.len() {
+                        message_meta = &buffer_meta.messages[meta_num];
+                    }
+                    continue;
+                }
+                if message_meta.code == b'S' && code == b'Z' {
+                    // println!("SYNC {:?}, got {:?}", &message_meta, &server_packets);
+                    server_packets = vec![];
+                    meta_num += 1;
+                    if resp.has_remaining() && meta_num < buffer_meta.messages.len() {
+                        message_meta = &buffer_meta.messages[meta_num];
+                    }
+                    continue;
+                }
+            }
+
             if !server.is_data_available() {
                 break;
             }
         }
-
+    
         // Report query executed statistics.
         client_stats.query();
         server.stats().query(

@@ -737,7 +737,7 @@ pub struct Parse {
     len: i32,
     pub name: String,
     pub generated_name: String,
-    query: String,
+    pub query: String,
     num_params: i16,
     param_types: Vec<i32>,
 }
